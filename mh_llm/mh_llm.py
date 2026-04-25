@@ -1,8 +1,8 @@
 import copy
-from functools import partial
 import math
 import random
 
+import numpy as np
 import torch
 from transformers import AutoTokenizer, PreTrainedTokenizer
 from vllm.logprobs import Logprob
@@ -84,25 +84,6 @@ class MHLLM:
     """
     return [list(logprob.values())[0].logprob for logprob in logprobs]
 
-  def _generate_intermediate_prompt(
-      self,
-      prompt: str,
-      proposed_tokens: list[float],
-  ) -> str:
-    """Generate intermediate prompts by appending proposed tokens.
-
-    Args:
-        prompt (str): The original prompt.
-        proposed_tokens (list[float]): The proposed tokens to append.
-
-    Returns:
-        str: The updated prompt with proposed tokens appended.
-    """
-    return prompt + self.tokenizer.decode(
-        proposed_tokens,
-        skip_special_tokens=True,
-    )
-
   def _mh_sample(
       self,
       prompt: str,
@@ -134,14 +115,15 @@ class MHLLM:
     output_tokens = []
     logprob: list[float] = []
     power_logprob: list[float] = []
+    base_prompt_token_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
 
     block_steps = int(math.ceil(max_new_tokens / block_size))
     for k in range(0, block_steps):
-      sampling_params.max_tokens = block_size
-      _prompt = self._generate_intermediate_prompt(
-          prompt,
-          output_tokens,
-      )
+      remaining_tokens = max_new_tokens - len(output_tokens)
+      if remaining_tokens <= 0:
+        break
+      sampling_params.max_tokens = min(block_size, remaining_tokens)
+      _prompt = {"prompt_token_ids": base_prompt_token_ids + output_tokens}
       output = self.llm.generate(
           _prompt,
           sampling_params=sampling_params,
@@ -153,13 +135,15 @@ class MHLLM:
       logprob.extend(self._extract_logprobs(out.logprobs))
       power_logprob.extend(self._extract_logprobs(out.power_logprobs))
 
+      if not output_tokens:
+        continue
+
       for _ in range(num_mcmc_steps):
-        # Propose new tokens from a random position (matches official randint(c, t-1)).
+        # Propose new tokens starting from a randomly sampled position
         idx = random.randint(0, len(output_tokens) - 1)
-        mcmc_prompt = self._generate_intermediate_prompt(
-            prompt,
-            output_tokens[:idx],
-        )
+        mcmc_prompt = {
+            "prompt_token_ids": base_prompt_token_ids + output_tokens[:idx]
+        }
         sampling_params.max_tokens = len(output_tokens) - idx
         mcmc_output = self.llm.generate(
             mcmc_prompt,
@@ -168,38 +152,44 @@ class MHLLM:
         )
         out = mcmc_output[0].outputs[0]
 
-        # get proposed logprobs as a list
+        # get proposed logprobs as a list and as tensor
         proposed_logprobs = self._extract_logprobs(out.logprobs)
         proposed_power_logprobs = self._extract_logprobs(out.power_logprobs)
 
-        # Truncate current logprobs to the actual proposal length (matches official
-        # log_prob_cur = log_probs_norm[idx-c : s-c] where s = len(prop)).
-        n_proposed = len(proposed_logprobs)
-        curr_logprobs = logprob[idx:idx + n_proposed]
-        curr_power_logprobs = power_logprob[idx:idx + n_proposed]
+        # Match original sampler's s=len(prop) behavior:
+        # compare against current suffix with same proposed length.
+        s = idx + len(proposed_logprobs)
+        curr_logprobs = logprob[idx:s]
+        curr_power_logprobs = power_logprob[idx:s]
 
-        # Calculate acceptance probabilities.
-        # MH ratio for target p^alpha with proposal q:
-        #   log A = alpha * (log p(prop) - log p(cur)) + (log q(cur) - log q(prop))
-        #         = log_power_prob_ratio - log_prob_ratio
-        log_prob_ratio = (sum(proposed_logprobs) - sum(curr_logprobs))
+        # Match original mcmc_power_samp acceptance ratio exactly:
+        # log_r = target(prop) + proposal(cur) - target(cur) - proposal(prop)
         if sampling_params.alpha == float('inf'):
-          # Greedy: accept only when base-model probability strictly improves.
-          power_delta = sum(proposed_power_logprobs) - sum(curr_power_logprobs)
-          A = float('inf') if power_delta > 0 else 0.0
-        else:
-          log_power_prob_ratio = (
+          log_r = (
               sum(proposed_power_logprobs) -
-              sum(curr_power_logprobs)) * sampling_params.alpha
-          A = math.exp(log_power_prob_ratio - log_prob_ratio)
+              sum(curr_power_logprobs)
+          )
+          accept = (log_r > 0.0)
+        else:
+          log_r = (
+              (sum(proposed_power_logprobs) -
+               sum(curr_power_logprobs)) * sampling_params.alpha +
+              (sum(curr_logprobs) - sum(proposed_logprobs))
+          )
+          accept_prob = math.exp(log_r)
+          accept = np.random.rand() < accept_prob
 
-        if A >= _ACCEPTANCE_THRESHOLD or random.random() < A:
+        if accept:
           # Accept the proposal
           output_tokens = output_tokens[:idx] + out.token_ids
           logprob = logprob[:idx] + proposed_logprobs
           power_logprob = power_logprob[:idx] + proposed_power_logprobs
 
-      if output_tokens[-1] == self.tokenizer.eos_token_id:
+      if self.tokenizer.eos_token_id in output_tokens:
+        eos_idx = output_tokens.index(self.tokenizer.eos_token_id)
+        output_tokens = output_tokens[:eos_idx + 1]
+        logprob = logprob[:eos_idx + 1]
+        power_logprob = power_logprob[:eos_idx + 1]
         break
 
     return self.tokenizer.decode(
@@ -244,7 +234,6 @@ class MHLLM:
           max_new_tokens,
           num_mcmc_steps,
       )
-    # override certain sampling parameter values
     sampling_params = _copy_sampling_params(
         sampling_params,
         n=1,
@@ -252,10 +241,13 @@ class MHLLM:
     )
 
     remaining_prompt_idx = list(range(len(prompts)))
-
     output_tokens = [[] for _ in prompts]
     logprob: list[list[float]] = [[] for _ in prompts]
     power_logprob: list[list[float]] = [[] for _ in prompts]
+    base_prompt_token_ids = [
+        self.tokenizer.encode(prompt, add_special_tokens=False)
+        for prompt in prompts
+    ]
 
     block_steps = int(math.ceil(max_new_tokens / block_size))
     _tqdm = tqdm.tqdm if use_tqdm else _dummytqdm
@@ -264,19 +256,38 @@ class MHLLM:
         colour='#CBA6F8',
         desc='MH Sampling',
     ) as pbar:
-      for k in range(0, block_steps):
-        _prompts = [
-            self._generate_intermediate_prompt(
-                prompts[i],
-                output_tokens[i],
-            ) for i in remaining_prompt_idx
-        ]
-        sp_list = [
-            _copy_sampling_params(
-                sampling_params,
-                max_tokens=block_size,
-            ) for i in remaining_prompt_idx
-        ]
+      for _ in range(block_steps):
+        # Remove finished prompts before this block.
+        finished = []
+        for i in remaining_prompt_idx:
+          if len(output_tokens[i]) >= max_new_tokens:
+            finished.append(i)
+          elif self.tokenizer.eos_token_id in output_tokens[i]:
+            eos_idx = output_tokens[i].index(self.tokenizer.eos_token_id)
+            output_tokens[i] = output_tokens[i][:eos_idx + 1]
+            logprob[i] = logprob[i][:eos_idx + 1]
+            power_logprob[i] = power_logprob[i][:eos_idx + 1]
+            finished.append(i)
+        if finished:
+          finished_set = set(finished)
+          remaining_prompt_idx = [
+              i for i in remaining_prompt_idx if i not in finished_set
+          ]
+          pbar.update(len(finished_set))
+        if not remaining_prompt_idx:
+          break
+
+        _prompts = [{
+            "prompt_token_ids": base_prompt_token_ids[i] + output_tokens[i]
+        } for i in remaining_prompt_idx]
+        sp_list = []
+        for i in remaining_prompt_idx:
+          remaining_tokens = max_new_tokens - len(output_tokens[i])
+          sp_list.append(
+              _copy_sampling_params(
+                  sampling_params,
+                  max_tokens=min(block_size, remaining_tokens),
+              ))
 
         outputs = self.llm.generate(
             _prompts,
@@ -285,27 +296,21 @@ class MHLLM:
         )
         for batch_idx, i in enumerate(remaining_prompt_idx):
           out = outputs[batch_idx].outputs[0]
-
           output_tokens[i].extend(out.token_ids)
           logprob[i].extend(self._extract_logprobs(out.logprobs))
           power_logprob[i].extend(self._extract_logprobs(out.power_logprobs))
 
-        # Perform MCMC steps for all remaining prompts
+        # Vectorized MCMC proposal step for all active prompts.
         for _ in range(num_mcmc_steps):
           idx_list = [
-              random.randint(
-                  0,
-                  len(output_tokens[i]) - 1,
-              ) if len(output_tokens[i]) > 1 else 0
+              random.randint(0, len(output_tokens[i]) - 1)
               for i in remaining_prompt_idx
           ]
-          mcmc_prompts = [
-              self._generate_intermediate_prompt(
-                  prompts[i],
-                  output_tokens[i][:idx_list[batch_idx]],
-              ) for batch_idx, i in enumerate(remaining_prompt_idx)
-          ]
-          sp_list = [
+          mcmc_prompts = [{
+              "prompt_token_ids":
+              base_prompt_token_ids[i] + output_tokens[i][:idx_list[batch_idx]]
+          } for batch_idx, i in enumerate(remaining_prompt_idx)]
+          mcmc_sp_list = [
               _copy_sampling_params(
                   sampling_params,
                   max_tokens=len(output_tokens[i]) - idx_list[batch_idx],
@@ -313,87 +318,38 @@ class MHLLM:
           ]
           mcmc_outputs = self.llm.generate(
               mcmc_prompts,
-              sampling_params=sp_list,
+              sampling_params=mcmc_sp_list,
               use_tqdm=False,
           )
-          outs = [out.outputs[0] for out in mcmc_outputs]
-
-          proposed_logprobs_list = [
-              self._extract_logprobs(outs[batch_idx].logprobs)
-              for batch_idx in range(len(remaining_prompt_idx))
-          ]
-          proposed_power_logprobs_list = [
-              self._extract_logprobs(outs[batch_idx].power_logprobs)
-              for batch_idx in range(len(remaining_prompt_idx))
-          ]
-
-          curr_logprobs_list = [
-              logprob[i][idx_list[batch_idx]:
-                         idx_list[batch_idx] + len(proposed_logprobs_list[batch_idx])]
-              for batch_idx, i in enumerate(remaining_prompt_idx)
-          ]
-          curr_power_logprobs_list = [
-              power_logprob[i][idx_list[batch_idx]:
-                               idx_list[batch_idx] + len(proposed_power_logprobs_list[batch_idx])]
-              for batch_idx, i in enumerate(remaining_prompt_idx)
-          ]
-
-          # Calculate acceptance probabilities and decide to accept/reject.
-          # MH ratio: log A = alpha*(log p(prop)-log p(cur)) + (log q(cur)-log q(prop))
-          #                  = log_power_prob_ratio - log_prob_ratio
-          log_prob_ratios = [(sum(proposed_logprobs_list[batch_idx]) -
-                              sum(curr_logprobs_list[batch_idx]))
-                             for batch_idx in range(len(remaining_prompt_idx))]
-
-          if sampling_params.alpha == float('inf'):
-            power_deltas = [
-                sum(proposed_power_logprobs_list[batch_idx]) -
-                sum(curr_power_logprobs_list[batch_idx])
-                for batch_idx in range(len(remaining_prompt_idx))
-            ]
-          else:
-            log_power_prob_ratios = [
-                (sum(proposed_power_logprobs_list[batch_idx]) -
-                 sum(curr_power_logprobs_list[batch_idx])) *
-                sampling_params.alpha
-                for batch_idx in range(len(remaining_prompt_idx))
-            ]
 
           for batch_idx, i in enumerate(remaining_prompt_idx):
+            out = mcmc_outputs[batch_idx].outputs[0]
+            idx = idx_list[batch_idx]
+            proposed_logprobs = self._extract_logprobs(out.logprobs)
+            proposed_power_logprobs = self._extract_logprobs(out.power_logprobs)
+            s = idx + len(proposed_logprobs)
+            curr_logprobs = logprob[i][idx:s]
+            curr_power_logprobs = power_logprob[i][idx:s]
+
             if sampling_params.alpha == float('inf'):
-              A = float('inf') if power_deltas[batch_idx] > 0 else 0.0
+              log_r = sum(proposed_power_logprobs) - sum(curr_power_logprobs)
+              accept = (log_r > 0.0)
             else:
-              try:
-                A = math.exp(log_power_prob_ratios[batch_idx] -
-                             log_prob_ratios[batch_idx])
-              except OverflowError:
-                A = float('inf')
+              log_r = (
+                  (sum(proposed_power_logprobs) -
+                   sum(curr_power_logprobs)) * sampling_params.alpha +
+                  (sum(curr_logprobs) - sum(proposed_logprobs))
+              )
+              accept = np.random.rand() < math.exp(log_r)
 
-            if A >= _ACCEPTANCE_THRESHOLD or random.random() < A:
-              # Accept the proposal
-              output_tokens[i] = (output_tokens[i][:idx_list[batch_idx]] +
-                                  outs[batch_idx].token_ids)
-              logprob[i] = (logprob[i][:idx_list[batch_idx]] +
-                            proposed_logprobs_list[batch_idx])
-              power_logprob[i] = (power_logprob[i][:idx_list[batch_idx]] +
-                                  proposed_power_logprobs_list[batch_idx])
+            if accept:
+              output_tokens[i] = output_tokens[i][:idx] + out.token_ids
+              logprob[i] = logprob[i][:idx] + proposed_logprobs
+              power_logprob[i] = power_logprob[i][:idx] + proposed_power_logprobs
 
-        # Remove prompts that have generated EOS token.
-        # Iterate over a copy to avoid modifying the list while iterating.
-        newly_done = [
-            i for i in remaining_prompt_idx
-            if output_tokens[i][-1] == self.tokenizer.eos_token_id
-        ]
-        for i in newly_done:
-          remaining_prompt_idx.remove(i)
-          pbar.update(1)
-
-        if not remaining_prompt_idx:
-          break
-
-      # add remaining results
-      for i in remaining_prompt_idx:
-        pbar.update(1)
+      # Account for unfinished prompts.
+      if remaining_prompt_idx:
+        pbar.update(len(remaining_prompt_idx))
 
     return [
         self.tokenizer.decode(
